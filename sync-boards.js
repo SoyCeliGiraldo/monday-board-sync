@@ -76,12 +76,18 @@ async function fetchExistingItems() {
   const items = [];
   let cursor = null;
 
+  const colIds = [COLUMN_IDS.boardId, COLUMN_IDS.owners, COLUMN_IDS.emails].map(c => `"${c}"`).join(",");
+
   const firstPage = await mondayApi(
     `query($boardId: [ID!]!) {
       boards(ids: $boardId) {
         items_page(limit: 100) {
           cursor
-          items { id column_values(ids: ["${COLUMN_IDS.boardId}"]) { text } }
+          items {
+            id
+            name
+            column_values(ids: [${colIds}]) { id text }
+          }
         }
       }
     }`,
@@ -97,7 +103,11 @@ async function fetchExistingItems() {
       `query($cursor: String!) {
         next_items_page(limit: 100, cursor: $cursor) {
           cursor
-          items { id column_values(ids: ["${COLUMN_IDS.boardId}"]) { text } }
+          items {
+            id
+            name
+            column_values(ids: [${colIds}]) { id text }
+          }
         }
       }`,
       { cursor }
@@ -110,15 +120,100 @@ async function fetchExistingItems() {
   return items;
 }
 
-async function deleteItems(itemIds) {
-  const batchSize = 10;
-  for (let i = 0; i < itemIds.length; i += batchSize) {
-    const batch = itemIds.slice(i, i + batchSize);
+function getColValue(item, colId) {
+  return item.column_values.find((c) => c.id === colId)?.text || "";
+}
+
+function buildBoardData(board) {
+  return {
+    name: board.name,
+    owners: board.owners.map((o) => o.name).join(", "),
+    emails: board.owners.map((o) => o.email).join(", "),
+    url: `https://${ACCOUNT_SLUG}.monday.com/boards/${board.id}`,
+  };
+}
+
+function detectChanges(item, board) {
+  const current = buildBoardData(board);
+  const changes = {};
+
+  if (item.name !== current.name) changes.name = current.name;
+  if (getColValue(item, COLUMN_IDS.owners) !== current.owners)
+    changes[COLUMN_IDS.owners] = current.owners;
+  if (getColValue(item, COLUMN_IDS.emails) !== current.emails)
+    changes[COLUMN_IDS.emails] = current.emails;
+
+  return Object.keys(changes).length > 0 ? changes : null;
+}
+
+async function updateItems(updates) {
+  const batchSize = 5;
+  let updated = 0;
+
+  for (let i = 0; i < updates.length; i += batchSize) {
+    const batch = updates.slice(i, i + batchSize);
     const mutations = batch
-      .map((id, idx) => `d${idx}: delete_item(item_id: ${id}) { id }`)
+      .map(({ itemId, changes, boardUrl }, idx) => {
+        const colValues = {};
+        if (changes[COLUMN_IDS.owners]) colValues[COLUMN_IDS.owners] = changes[COLUMN_IDS.owners];
+        if (changes[COLUMN_IDS.emails]) colValues[COLUMN_IDS.emails] = changes[COLUMN_IDS.emails];
+        colValues[COLUMN_IDS.url] = { url: boardUrl, text: "Abrir" };
+
+        const parts = [];
+
+        if (changes.name) {
+          const safeName = changes.name.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+          parts.push(
+            `n${idx}: change_simple_column_value(item_id: ${itemId}, board_id: ${DIRECTORY_BOARD_ID}, column_id: "name", value: "\\"${safeName}\\"") { id }`
+          );
+        }
+
+        const colValue = JSON.stringify(colValues)
+          .replace(/\\/g, "\\\\")
+          .replace(/"/g, '\\"');
+        parts.push(
+          `u${idx}: change_multiple_column_values(item_id: ${itemId}, board_id: ${DIRECTORY_BOARD_ID}, column_values: "${colValue}") { id }`
+        );
+
+        return parts.join("\n");
+      })
+      .join("\n");
+
+    await mondayApi(`mutation { ${mutations} }`);
+    updated += batch.length;
+    console.log(`   Actualizados ${updated}/${updates.length}`);
+    await sleep(500);
+  }
+}
+
+async function ensureUrls(items, boardMap) {
+  const missing = items.filter((item) => {
+    const boardId = getColValue(item, COLUMN_IDS.boardId);
+    return boardId && boardMap.has(boardId);
+  });
+
+  if (missing.length === 0) return;
+
+  console.log(`   Verificando URLs en ${missing.length} ítems existentes...`);
+  const batchSize = 5;
+  let done = 0;
+
+  for (let i = 0; i < missing.length; i += batchSize) {
+    const batch = missing.slice(i, i + batchSize);
+    const mutations = batch
+      .map((item, idx) => {
+        const boardId = getColValue(item, COLUMN_IDS.boardId);
+        const boardUrl = `https://${ACCOUNT_SLUG}.monday.com/boards/${boardId}`;
+        const colValue = JSON.stringify({
+          [COLUMN_IDS.url]: { url: boardUrl, text: "Abrir" },
+        }).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        return `u${idx}: change_multiple_column_values(item_id: ${item.id}, board_id: ${DIRECTORY_BOARD_ID}, column_values: "${colValue}") { id }`;
+      })
       .join("\n");
     await mondayApi(`mutation { ${mutations} }`);
-    console.log(`  Eliminados ${Math.min(i + batchSize, itemIds.length)}/${itemIds.length}`);
+    done += batch.length;
+    if (done % 50 === 0 || done === missing.length)
+      console.log(`   URLs ${done}/${missing.length}`);
     await sleep(500);
   }
 }
@@ -131,14 +226,12 @@ async function createItems(boards) {
     const batch = boards.slice(i, i + batchSize);
     const mutations = batch
       .map((board, idx) => {
-        const ownerNames = board.owners.map((o) => o.name).join(", ");
-        const ownerEmails = board.owners.map((o) => o.email).join(", ");
-        const boardUrl = `https://${ACCOUNT_SLUG}.monday.com/boards/${board.id}`;
+        const data = buildBoardData(board);
         const colValues = JSON.stringify({
           [COLUMN_IDS.boardId]: board.id,
-          [COLUMN_IDS.owners]: ownerNames,
-          [COLUMN_IDS.emails]: ownerEmails,
-          [COLUMN_IDS.url]: { url: boardUrl, text: "Abrir" },
+          [COLUMN_IDS.owners]: data.owners,
+          [COLUMN_IDS.emails]: data.emails,
+          [COLUMN_IDS.url]: { url: data.url, text: "Abrir" },
         }).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 
         const safeName = board.name
@@ -151,7 +244,7 @@ async function createItems(boards) {
 
     await mondayApi(`mutation { ${mutations} }`);
     created += batch.length;
-    console.log(`  Creados ${created}/${boards.length}`);
+    console.log(`   Creados ${created}/${boards.length}`);
     await sleep(600);
   }
 
@@ -169,33 +262,45 @@ async function main() {
 
   console.log("1. Consultando todos los tableros de la cuenta...");
   const boards = await fetchAllBoards();
+  const boardMap = new Map(boards.map((b) => [b.id, b]));
   console.log(`   Total: ${boards.length} tableros encontrados.\n`);
 
   console.log("2. Consultando ítems existentes en el directorio...");
   const existing = await fetchExistingItems();
   console.log(`   Total: ${existing.length} ítems existentes.\n`);
 
-  const existingBoardIds = new Set(
-    existing.map((item) => item.column_values[0]?.text).filter(Boolean)
-  );
-  const liveBoardIds = new Set(boards.map((b) => b.id));
+  const existingByBoardId = new Map();
+  for (const item of existing) {
+    const bid = getColValue(item, COLUMN_IDS.boardId);
+    if (bid) existingByBoardId.set(bid, item);
+  }
 
-  const toAdd = boards.filter((b) => !existingBoardIds.has(b.id));
-  const toRemove = existing.filter(
-    (item) =>
-      item.column_values[0]?.text &&
-      !liveBoardIds.has(item.column_values[0].text)
-  );
-  const toUpdate = existing.filter(
-    (item) =>
-      item.column_values[0]?.text &&
-      liveBoardIds.has(item.column_values[0].text)
-  );
+  const toAdd = boards.filter((b) => !existingByBoardId.has(b.id));
+
+  const toUpdate = [];
+  for (const [bid, item] of existingByBoardId) {
+    const board = boardMap.get(bid);
+    if (!board) continue;
+    const changes = detectChanges(item, board);
+    if (changes) {
+      toUpdate.push({
+        itemId: item.id,
+        itemName: item.name,
+        changes,
+        boardUrl: `https://${ACCOUNT_SLUG}.monday.com/boards/${bid}`,
+      });
+    }
+  }
+
+  const orphaned = [...existingByBoardId.entries()]
+    .filter(([bid]) => !boardMap.has(bid))
+    .map(([bid, item]) => ({ itemId: item.id, itemName: item.name, boardId: bid }));
 
   console.log(`3. Resumen de cambios:`);
   console.log(`   - Nuevos por agregar: ${toAdd.length}`);
-  console.log(`   - Obsoletos por eliminar: ${toRemove.length}`);
-  console.log(`   - Existentes (se actualizan URLs): ${toUpdate.length}\n`);
+  console.log(`   - Con cambios (nombre/dueños): ${toUpdate.length}`);
+  console.log(`   - Tableros eliminados (huérfanos): ${orphaned.length}`);
+  console.log(`   - Sin cambios: ${existing.length - toUpdate.length - orphaned.length}\n`);
 
   if (DRY_RUN) {
     if (toAdd.length > 0) {
@@ -203,43 +308,33 @@ async function main() {
       toAdd.slice(0, 10).forEach((b) => console.log(`     + ${b.name} (${b.id})`));
       if (toAdd.length > 10) console.log(`     ... y ${toAdd.length - 10} más`);
     }
-    if (toRemove.length > 0) {
-      console.log("   Ítems obsoletos:");
-      toRemove.slice(0, 5).forEach((item) =>
-        console.log(`     - ID item: ${item.id} (board: ${item.column_values[0]?.text})`)
+    if (toUpdate.length > 0) {
+      console.log("\n   Tableros con cambios:");
+      toUpdate.slice(0, 10).forEach(({ itemName, changes }) => {
+        const fields = Object.keys(changes).join(", ");
+        console.log(`     ~ ${itemName} → cambios en: ${fields}`);
+      });
+      if (toUpdate.length > 10) console.log(`     ... y ${toUpdate.length - 10} más`);
+    }
+    if (orphaned.length > 0) {
+      console.log("\n   Huérfanos (tablero ya no existe, NO se eliminan del directorio):");
+      orphaned.forEach(({ itemName, boardId }) =>
+        console.log(`     ? ${itemName} (board ${boardId})`)
       );
     }
     console.log("\nDry-run finalizado. Ejecuta sin DRY_RUN para aplicar.");
     return;
   }
 
-  if (toRemove.length > 0) {
-    console.log("4. Eliminando tableros obsoletos...");
-    await deleteItems(toRemove.map((item) => item.id));
+  if (toUpdate.length > 0) {
+    console.log("4. Actualizando ítems con cambios...");
+    await updateItems(toUpdate);
     console.log("   Hecho.\n");
   }
 
-  if (toUpdate.length > 0) {
-    console.log("5. Actualizando URLs en ítems existentes...");
-    const batchSize = 5;
-    let updated = 0;
-    for (let i = 0; i < toUpdate.length; i += batchSize) {
-      const batch = toUpdate.slice(i, i + batchSize);
-      const mutations = batch
-        .map((item, idx) => {
-          const boardId = item.column_values[0]?.text;
-          const boardUrl = `https://${ACCOUNT_SLUG}.monday.com/boards/${boardId}`;
-          const colValue = JSON.stringify({
-            [COLUMN_IDS.url]: { url: boardUrl, text: "Abrir" },
-          }).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-          return `u${idx}: change_multiple_column_values(item_id: ${item.id}, board_id: ${DIRECTORY_BOARD_ID}, column_values: "${colValue}") { id }`;
-        })
-        .join("\n");
-      await mondayApi(`mutation { ${mutations} }`);
-      updated += batch.length;
-      console.log(`   Actualizados ${updated}/${toUpdate.length}`);
-      await sleep(500);
-    }
+  if (existing.length > 0) {
+    console.log("5. Asegurando URLs en ítems existentes...");
+    await ensureUrls(existing, boardMap);
     console.log("   Hecho.\n");
   }
 
@@ -249,8 +344,19 @@ async function main() {
     console.log("   Hecho.\n");
   }
 
+  if (orphaned.length > 0) {
+    console.log("NOTA: Los siguientes ítems corresponden a tableros que ya no existen.");
+    console.log("      NO se eliminan para preservar datos de revisión/justificación.");
+    orphaned.forEach(({ itemName, boardId }) =>
+      console.log(`      ? ${itemName} (board ${boardId})`)
+    );
+    console.log();
+  }
+
   console.log("=== Sincronización completada ===");
-  console.log(`   Tableros en directorio: ${toUpdate.length + toAdd.length}`);
+  console.log(`   Ítems actualizados: ${toUpdate.length}`);
+  console.log(`   Ítems nuevos: ${toAdd.length}`);
+  console.log(`   Total en directorio: ${existing.length + toAdd.length}`);
 }
 
 main().catch((err) => {

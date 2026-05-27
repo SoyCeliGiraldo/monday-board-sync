@@ -1,9 +1,7 @@
 name: Sync Monday.com Board Directory
 
 on:
-  schedule:
-    - cron: "0 12 * * *" # Todos los días a las 7:00 AM (hora Colombia, UTC-5)
-  workflow_dispatch: # Permite ejecución manual desde GitHub
+  workflow_dispatch: # Solo ejecución manual desde GitHub
 
 jobs:
   sync:
@@ -18,7 +16,6 @@ jobs:
           node-version: "20"
 
       - name: Run board sync
-        working-directory: monday-board-sync
         env:
           MONDAY_API_TOKEN: ${{ secrets.MONDAY_API_TOKEN }}
         run: node sync-boards.js

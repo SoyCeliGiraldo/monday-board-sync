@@ -1,0 +1,11 @@
+{
+  "name": "monday-board-sync",
+  "version": "1.0.0",
+  "description": "Sincroniza todos los tableros de Monday.com en un tablero directorio",
+  "type": "module",
+  "scripts": {
+    "sync": "node sync-boards.js",
+    "dry-run": "DRY_RUN=true node sync-boards.js"
+  },
+  "dependencies": {}
+}
